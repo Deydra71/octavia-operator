@@ -18,6 +18,7 @@ package v1beta1
 
 import (
 	"github.com/openstack-k8s-operators/lib-common/modules/common/condition"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/tls"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -144,6 +145,11 @@ type OctaviaAmphoraControllerSpecCore struct {
 	// +kubebuilder:default={}
 	// AmphoraCustomFlavors - User-defined flavors for Octavia
 	AmphoraCustomFlavors []OctaviaAmphoraFlavor `json:"amphoraCustomFlavors,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// +operator-sdk:csv:customresourcedefinitions:type=spec
+	// TLS - Parameters related to the TLS
+	TLS tls.Ca `json:"tls,omitempty"`
 }
 
 // OctaviaAmphoraControllerStatus defines the observed state of the Octavia Amphora Controller

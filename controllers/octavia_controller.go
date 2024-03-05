@@ -33,6 +33,8 @@ import (
 	nad "github.com/openstack-k8s-operators/lib-common/modules/common/networkattachment"
 	common_rbac "github.com/openstack-k8s-operators/lib-common/modules/common/rbac"
 	oko_secret "github.com/openstack-k8s-operators/lib-common/modules/common/secret"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/service"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/tls"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/util"
 	mariadbv1 "github.com/openstack-k8s-operators/mariadb-operator/api/v1beta1"
 	octaviav1 "github.com/openstack-k8s-operators/octavia-operator/api/v1beta1"
@@ -190,6 +192,23 @@ func (r *OctaviaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 	return r.reconcileNormal(ctx, instance, helper)
 }
 
+// fields to index to reconcile when change
+const (
+	passwordSecretField     = ".spec.secret"
+	caBundleSecretNameField = ".spec.tls.caBundleSecretName"
+	tlsAPIInternalField     = ".spec.tls.api.internal.secretName"
+	tlsAPIPublicField       = ".spec.tls.api.public.secretName"
+)
+
+var (
+	allWatchFields = []string{
+		passwordSecretField,
+		caBundleSecretNameField,
+		tlsAPIInternalField,
+		tlsAPIPublicField,
+	}
+)
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *OctaviaReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
@@ -212,7 +231,7 @@ func (r *OctaviaReconciler) reconcileDelete(ctx context.Context, instance *octav
 	util.LogForObject(helper, "Reconciling Service delete", instance)
 
 	// remove db finalizer first
-	db, err := mariadbv1.GetDatabaseByName(ctx, helper, instance.Name)
+	db, err := mariadbv1.GetDatabaseByName(ctx, helper, octavia.DatabaseName)
 	if err != nil && !k8s_errors.IsNotFound(err) {
 		return ctrl.Result{}, err
 	}
@@ -243,65 +262,6 @@ func (r *OctaviaReconciler) reconcileInit(
 	Log.Info("Reconciling Service init")
 
 	//
-	// create service DB instance
-	//
-	db := mariadbv1.NewDatabase(
-		instance.Name,
-		instance.Spec.DatabaseUser,
-		instance.Spec.Secret,
-		map[string]string{
-			"dbName": instance.Spec.DatabaseInstance,
-		},
-	)
-	// create or patch the DB
-	ctrlResult, err := db.CreateOrPatchDB(
-		ctx,
-		helper,
-	)
-	if err != nil {
-		instance.Status.Conditions.Set(condition.FalseCondition(
-			condition.DBReadyCondition,
-			condition.ErrorReason,
-			condition.SeverityWarning,
-			condition.DBReadyErrorMessage,
-			err.Error()))
-		return ctrl.Result{}, err
-	}
-	if (ctrlResult != ctrl.Result{}) {
-		instance.Status.Conditions.Set(condition.FalseCondition(
-			condition.DBReadyCondition,
-			condition.RequestedReason,
-			condition.SeverityInfo,
-			condition.DBReadyRunningMessage))
-		return ctrlResult, nil
-	}
-
-	// wait for the DB to be setup
-	ctrlResult, err = db.WaitForDBCreated(ctx, helper)
-	if err != nil {
-		instance.Status.Conditions.Set(condition.FalseCondition(
-			condition.DBReadyCondition,
-			condition.ErrorReason,
-			condition.SeverityWarning,
-			condition.DBReadyErrorMessage,
-			err.Error()))
-		return ctrlResult, err
-	}
-	if (ctrlResult != ctrl.Result{}) {
-		instance.Status.Conditions.Set(condition.FalseCondition(
-			condition.DBReadyCondition,
-			condition.RequestedReason,
-			condition.SeverityInfo,
-			condition.DBReadyRunningMessage))
-		return ctrlResult, nil
-	}
-	// update Status.DatabaseHostname, used to bootstrap/config the service
-	instance.Status.DatabaseHostname = db.GetDatabaseHostname()
-	instance.Status.Conditions.MarkTrue(condition.DBReadyCondition, condition.DBReadyMessage)
-
-	// create service DB - end
-
-	//
 	// run octavia db sync
 	//
 	dbSyncHash := instance.Status.Hash[octaviav1.DbSyncHash]
@@ -314,7 +274,7 @@ func (r *OctaviaReconciler) reconcileInit(
 		time.Duration(5)*time.Second,
 		dbSyncHash,
 	)
-	ctrlResult, err = dbSyncjob.DoJob(
+	ctrlResult, err := dbSyncjob.DoJob(
 		ctx,
 		helper,
 	)
@@ -471,6 +431,17 @@ func (r *OctaviaReconciler) reconcileNormal(ctx context.Context, instance *octav
 	// run check OpenStack secret - end
 
 	//
+	// create service DB instance
+	//
+	db, result, err := r.ensureDB(ctx, helper, instance)
+	if err != nil {
+		return ctrl.Result{}, err
+	} else if (result != ctrl.Result{}) {
+		return result, nil
+	}
+	// create service DB - end
+
+	//
 	// Create ConfigMaps and Secrets required as input for the Service and calculate an overall hash of hashes
 	//
 
@@ -480,7 +451,7 @@ func (r *OctaviaReconciler) reconcileNormal(ctx context.Context, instance *octav
 	// - %-config configmap holding minimal octavia config required to get the service up, user can add additional files to be added to the service
 	// - parameters which has passwords gets added from the OpenStack secret via the init container
 	//
-	err = r.generateServiceConfigMaps(ctx, instance, helper, &configMapVars)
+	err = r.generateServiceConfigMaps(ctx, instance, helper, &configMapVars, db)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -537,6 +508,7 @@ func (r *OctaviaReconciler) reconcileNormal(ctx context.Context, instance *octav
 		return ctrl.Result{}, fmt.Errorf("failed create network annotation from %s: %w",
 			instance.Spec.OctaviaAPI.NetworkAttachments, err)
 	}
+	instance.Status.Conditions.MarkTrue(condition.NetworkAttachmentsReadyCondition, condition.NetworkAttachmentsReadyMessage)
 
 	// Handle service init
 	ctrlResult, err := r.reconcileInit(ctx, instance, helper, serviceLabels, serviceAnnotations)
@@ -673,6 +645,7 @@ func (r *OctaviaReconciler) generateServiceConfigMaps(
 	instance *octaviav1.Octavia,
 	h *helper.Helper,
 	envVars *map[string]env.Setter,
+	db *mariadbv1.Database,
 ) error {
 	//
 	// create Configmap/Secret required for octavia input
@@ -683,17 +656,40 @@ func (r *OctaviaReconciler) generateServiceConfigMaps(
 
 	cmLabels := labels.GetLabels(instance, labels.GetGroupLabel(octavia.ServiceName), map[string]string{})
 
+	var tlsCfg *tls.Service
+	if instance.Spec.OctaviaAPI.TLS.Ca.CaBundleSecretName != "" {
+		tlsCfg = &tls.Service{}
+	}
+
 	// customData hold any customization for the service.
 	// custom.conf is going to /etc/<service>/<service>.conf.d
 	// all other files get placed into /etc/<service> to allow overwrite of e.g. logging.conf or policy.json
 	// TODO: make sure custom.conf can not be overwritten
-	customData := map[string]string{common.CustomServiceConfigFileName: instance.Spec.CustomServiceConfig}
+	customData := map[string]string{
+		common.CustomServiceConfigFileName: instance.Spec.CustomServiceConfig,
+		"my.cnf":                           db.GetDatabaseClientConfig(tlsCfg), //(mschuppert) for now just get the default my.cnf
+	}
 	for key, data := range instance.Spec.DefaultConfigOverwrite {
 		customData[key] = data
 	}
 
 	templateParameters := make(map[string]interface{})
 	templateParameters["ServiceUser"] = instance.Spec.ServiceUser
+
+	// create httpd  vhost template parameters
+	httpdVhostConfig := map[string]interface{}{}
+	for _, endpt := range []service.Endpoint{service.EndpointInternal, service.EndpointPublic} {
+		endptConfig := map[string]interface{}{}
+		endptConfig["ServerName"] = fmt.Sprintf("%s-%s.%s.svc", octavia.ServiceName, endpt.String(), instance.Namespace)
+		endptConfig["TLS"] = false // default TLS to false, and set it bellow to true if enabled
+		if instance.Spec.OctaviaAPI.TLS.API.Enabled(endpt) {
+			endptConfig["TLS"] = true
+			endptConfig["SSLCertificateFile"] = fmt.Sprintf("/etc/pki/tls/certs/%s.crt", endpt.String())
+			endptConfig["SSLCertificateKeyFile"] = fmt.Sprintf("/etc/pki/tls/private/%s.key", endpt.String())
+		}
+		httpdVhostConfig[endpt.String()] = endptConfig
+	}
+	templateParameters["VHosts"] = httpdVhostConfig
 
 	cms := []util.Template{
 		// ScriptsConfigMap
@@ -765,6 +761,7 @@ func (r *OctaviaReconciler) apiDeploymentCreateOrUpdate(instance *octaviav1.Octa
 		deployment.Spec.TransportURLSecret = instance.Status.TransportURLSecret
 		deployment.Spec.Secret = instance.Spec.Secret
 		deployment.Spec.ServiceAccount = instance.RbacResourceName()
+		deployment.Spec.TLS = instance.Spec.OctaviaAPI.TLS
 		if len(deployment.Spec.NodeSelector) == 0 {
 			deployment.Spec.NodeSelector = instance.Spec.NodeSelector
 		}
@@ -827,6 +824,7 @@ func (r *OctaviaReconciler) amphoraControllerDaemonSetCreateOrUpdate(
 		daemonset.Spec.LoadBalancerSSHPrivKey = instance.Spec.LoadBalancerSSHPrivKey
 		daemonset.Spec.LoadBalancerSSHPubKey = instance.Spec.LoadBalancerSSHPubKey
 		daemonset.Spec.AmphoraCustomFlavors = instance.Spec.AmphoraCustomFlavors
+		daemonset.Spec.TLS = instance.Spec.OctaviaAPI.TLS.Ca
 		if len(daemonset.Spec.NodeSelector) == 0 {
 			daemonset.Spec.NodeSelector = instance.Spec.NodeSelector
 		}
@@ -874,4 +872,71 @@ func amphoraControllerErrorMessage(role string) string {
 		octaviav1.Worker:        octaviav1.OctaviaWorkerReadyErrorMessage,
 	}
 	return condMap[role]
+}
+
+func (r *OctaviaReconciler) ensureDB(
+	ctx context.Context,
+	h *helper.Helper,
+	instance *octaviav1.Octavia,
+) (*mariadbv1.Database, ctrl.Result, error) {
+	//
+	// create service DB instance
+	//
+	db := mariadbv1.NewDatabase(
+		octavia.DatabaseName,
+		instance.Spec.DatabaseUser,
+		instance.Spec.Secret,
+		map[string]string{
+			"dbName": instance.Spec.DatabaseInstance,
+		},
+	)
+
+	// create or patch the DB
+	ctrlResult, err := db.CreateOrPatchDBByName(
+		ctx,
+		h,
+		instance.Spec.DatabaseInstance,
+	)
+	if err != nil {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			condition.DBReadyCondition,
+			condition.ErrorReason,
+			condition.SeverityWarning,
+			condition.DBReadyErrorMessage,
+			err.Error()))
+		return db, ctrl.Result{}, err
+	}
+	if (ctrlResult != ctrl.Result{}) {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			condition.DBReadyCondition,
+			condition.RequestedReason,
+			condition.SeverityInfo,
+			condition.DBReadyRunningMessage))
+		return db, ctrlResult, nil
+	}
+	// wait for the DB to be setup
+	// (ksambor) should we use WaitForDBCreatedWithTimeout instead?
+	ctrlResult, err = db.WaitForDBCreated(ctx, h)
+	if err != nil {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			condition.DBReadyCondition,
+			condition.ErrorReason,
+			condition.SeverityWarning,
+			condition.DBReadyErrorMessage,
+			err.Error()))
+		return db, ctrlResult, err
+	}
+	if (ctrlResult != ctrl.Result{}) {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			condition.DBReadyCondition,
+			condition.RequestedReason,
+			condition.SeverityInfo,
+			condition.DBReadyRunningMessage))
+		return db, ctrlResult, nil
+	}
+
+	// update Status.DatabaseHostname, used to config the service
+	instance.Status.DatabaseHostname = db.GetDatabaseHostname()
+	instance.Status.Conditions.MarkTrue(condition.DBReadyCondition, condition.DBReadyMessage)
+	return db, ctrlResult, nil
 }

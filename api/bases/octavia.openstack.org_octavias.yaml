@@ -445,6 +445,36 @@ spec:
                     default: octavia
                     description: ServiceUser - service user name
                     type: string
+                  tls:
+                    description: TLS - Parameters related to the TLS
+                    properties:
+                      api:
+                        description: API tls type which encapsulates for API services
+                        properties:
+                          internal:
+                            description: Internal GenericService - holds the secret
+                              for the internal endpoint
+                            properties:
+                              secretName:
+                                description: SecretName - holding the cert, key for
+                                  the service
+                                type: string
+                            type: object
+                          public:
+                            description: Public GenericService - holds the secret
+                              for the public endpoint
+                            properties:
+                              secretName:
+                                description: SecretName - holding the cert, key for
+                                  the service
+                                type: string
+                            type: object
+                        type: object
+                      caBundleSecretName:
+                        description: CaBundleSecretName - holding the CA certs in
+                          a pre-created bundle file
+                        type: string
+                    type: object
                   transportURLSecret:
                     description: TransportURLSecret - Secret containing RabbitMQ transportURL
                     type: string
@@ -655,6 +685,14 @@ spec:
                     description: TenantName - the name of the OpenStack tenant that
                       controls the Octavia resources TODO(gthiemonge) same as ServiceAccount?
                     type: string
+                  tls:
+                    description: TLS - Parameters related to the TLS
+                    properties:
+                      caBundleSecretName:
+                        description: CaBundleSecretName - holding the CA certs in
+                          a pre-created bundle file
+                        type: string
+                    type: object
                   transportURLSecret:
                     description: TransportURLSecret - Secret containing RabbitMQ transportURL
                     type: string
@@ -865,6 +903,14 @@ spec:
                     description: TenantName - the name of the OpenStack tenant that
                       controls the Octavia resources TODO(gthiemonge) same as ServiceAccount?
                     type: string
+                  tls:
+                    description: TLS - Parameters related to the TLS
+                    properties:
+                      caBundleSecretName:
+                        description: CaBundleSecretName - holding the CA certs in
+                          a pre-created bundle file
+                        type: string
+                    type: object
                   transportURLSecret:
                     description: TransportURLSecret - Secret containing RabbitMQ transportURL
                     type: string
@@ -1075,6 +1121,14 @@ spec:
                     description: TenantName - the name of the OpenStack tenant that
                       controls the Octavia resources TODO(gthiemonge) same as ServiceAccount?
                     type: string
+                  tls:
+                    description: TLS - Parameters related to the TLS
+                    properties:
+                      caBundleSecretName:
+                        description: CaBundleSecretName - holding the CA certs in
+                          a pre-created bundle file
+                        type: string
+                    type: object
                   transportURLSecret:
                     description: TransportURLSecret - Secret containing RabbitMQ transportURL
                     type: string
